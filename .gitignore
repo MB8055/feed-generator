@@ -135,3 +135,10 @@ dist
 
 # Go build output
 go/go
+
+# dev scratch
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.uris.txt
+scripts/_x.ts
