@@ -1,66 +1,104 @@
-import { Subscription } from '@atproto/xrpc-server'
-import { cborToLexRecord, readCar } from '@atproto/repo'
-import { BlobRef } from '@atproto/lexicon'
-import { ids, lexicons } from '../lexicon/lexicons'
-import { Record as PostRecord } from '../lexicon/types/app/bsky/feed/post'
-import { Record as RepostRecord } from '../lexicon/types/app/bsky/feed/repost'
-import { Record as LikeRecord } from '../lexicon/types/app/bsky/feed/like'
-import { Record as FollowRecord } from '../lexicon/types/app/bsky/graph/follow'
-import {
-  Commit,
-  OutputSchema as RepoEvent,
-  isCommit,
-} from '../lexicon/types/com/atproto/sync/subscribeRepos'
 import { Database } from '../db'
 
+// Jetstream (https://github.com/bluesky-social/jetstream) delivers pre-filtered,
+// JSON-encoded repo events. Filtering server-side with `wantedCollections` means we
+// only download posts, instead of the entire network firehose.
+
+export type JetstreamCommit = {
+  rev: string
+  operation: 'create' | 'update' | 'delete'
+  collection: string
+  rkey: string
+  record?: any
+  cid?: string
+}
+
+export type JetstreamEvent = {
+  did: string
+  time_us: number
+  kind: 'commit' | 'identity' | 'account'
+  commit?: JetstreamCommit
+}
+
+// Node 22+ ships a global WebSocket, but the installed @types/node (20) doesn't declare it.
+const WS: any = (globalThis as any).WebSocket
+
+const WANTED_COLLECTIONS = ['app.bsky.feed.post']
+// Rewind a little on reconnect so events in flight when the socket dropped are replayed.
+const CURSOR_REWIND_US = 5_000_000
+const CURSOR_SAVE_INTERVAL_MS = 5_000
+const STATS_INTERVAL_MS = 60_000
+
 export abstract class FirehoseSubscriptionBase {
-  public sub: Subscription<RepoEvent>
+  private lastCursorSave = 0
+  private bytes = 0
+  private events = 0
 
   constructor(public db: Database, public service: string) {
-    this.sub = new Subscription({
-      service: service,
-      method: ids.ComAtprotoSyncSubscribeRepos,
-      getParams: () => this.getCursor(),
-      validate: (value: unknown) => {
-        try {
-          return lexicons.assertValidXrpcMessage<RepoEvent>(
-            ids.ComAtprotoSyncSubscribeRepos,
-            value,
-          )
-        } catch (err) {
-          console.error('repo subscription skipped invalid message', err)
-        }
-      },
-    })
+    if (!WS) {
+      throw new Error('global WebSocket not available; Node 22+ is required')
+    }
   }
 
-  abstract handleEvent(evt: RepoEvent): Promise<void>
+  abstract handleEvent(evt: JetstreamEvent): Promise<void>
 
   async run(subscriptionReconnectDelay: number) {
-    try {
-      for await (const evt of this.sub) {
-        this.handleEvent(evt).catch((err) => {
-          console.error('repo subscription could not handle message', err)
-        })
-        // update stored cursor every 20 events or so
-        if (isCommit(evt) && evt.seq % 20 === 0) {
-          await this.updateCursor(evt.seq)
-        }
-      }
-    } catch (err) {
-      console.error('repo subscription errored', err)
-      setTimeout(
-        () => this.run(subscriptionReconnectDelay),
-        subscriptionReconnectDelay,
+    setInterval(() => {
+      console.log(
+        `[stats] last minute: ${this.events} events, ${(this.bytes / 1048576).toFixed(2)} MB received`,
       )
+      this.bytes = 0
+      this.events = 0
+    }, STATS_INTERVAL_MS).unref()
+    this.connect(subscriptionReconnectDelay)
+  }
+
+  private async connect(reconnectDelay: number) {
+    const params = new URLSearchParams()
+    for (const c of WANTED_COLLECTIONS) params.append('wantedCollections', c)
+    const { cursor } = await this.getCursor()
+    if (cursor) params.set('cursor', String(Math.max(cursor - CURSOR_REWIND_US, 0)))
+
+    const url = `${this.service.replace(/\/$/, '')}/subscribe?${params}`
+    console.log(`connecting to ${url}`)
+    const ws = new WS(url)
+
+    ws.onmessage = (msg: { data: unknown }) => {
+      const raw = typeof msg.data === 'string' ? msg.data : String(msg.data)
+      this.bytes += Buffer.byteLength(raw)
+      this.events++
+      let evt: JetstreamEvent
+      try {
+        evt = JSON.parse(raw)
+      } catch (err) {
+        console.error('jetstream skipped unparseable message', err)
+        return
+      }
+      this.handleEvent(evt).catch((err) => {
+        console.error('jetstream could not handle message', err)
+      })
+      const now = Date.now()
+      if (evt.time_us && now - this.lastCursorSave > CURSOR_SAVE_INTERVAL_MS) {
+        this.lastCursorSave = now
+        this.updateCursor(evt.time_us).catch((err) =>
+          console.error('could not save cursor', err),
+        )
+      }
+    }
+    ws.onerror = (err: any) => {
+      console.error('jetstream socket error', err?.message ?? err)
+    }
+    ws.onclose = () => {
+      console.error(`jetstream closed, reconnecting in ${reconnectDelay}ms`)
+      setTimeout(() => this.connect(reconnectDelay), reconnectDelay)
     }
   }
 
   async updateCursor(cursor: number) {
     await this.db
-      .updateTable('sub_state')
-      .set({ cursor })
-      .where('service', '=', this.service)
+      .insertInto('sub_state')
+      .values({ service: this.service, cursor })
+      .onConflict((oc) => oc.column('service').doUpdateSet({ cursor }))
       .execute()
   }
 
@@ -72,120 +110,4 @@ export abstract class FirehoseSubscriptionBase {
       .executeTakeFirst()
     return res ? { cursor: res.cursor } : {}
   }
-}
-
-export const getOpsByType = async (evt: Commit): Promise<OperationsByType> => {
-  const car = await readCar(evt.blocks)
-  const opsByType: OperationsByType = {
-    posts: { creates: [], deletes: [] },
-    reposts: { creates: [], deletes: [] },
-    likes: { creates: [], deletes: [] },
-    follows: { creates: [], deletes: [] },
-  }
-
-  for (const op of evt.ops) {
-    const uri = `at://${evt.repo}/${op.path}`
-    const [collection] = op.path.split('/')
-
-    if (op.action === 'update') continue // updates not supported yet
-
-    if (op.action === 'create') {
-      if (!op.cid) continue
-      const recordBytes = car.blocks.get(op.cid)
-      if (!recordBytes) continue
-      const record = cborToLexRecord(recordBytes)
-      const create = { uri, cid: op.cid.toString(), author: evt.repo }
-      if (collection === ids.AppBskyFeedPost && isPost(record)) {
-        opsByType.posts.creates.push({ record, ...create })
-      } else if (collection === ids.AppBskyFeedRepost && isRepost(record)) {
-        opsByType.reposts.creates.push({ record, ...create })
-      } else if (collection === ids.AppBskyFeedLike && isLike(record)) {
-        opsByType.likes.creates.push({ record, ...create })
-      } else if (collection === ids.AppBskyGraphFollow && isFollow(record)) {
-        opsByType.follows.creates.push({ record, ...create })
-      }
-    }
-
-    if (op.action === 'delete') {
-      if (collection === ids.AppBskyFeedPost) {
-        opsByType.posts.deletes.push({ uri })
-      } else if (collection === ids.AppBskyFeedRepost) {
-        opsByType.reposts.deletes.push({ uri })
-      } else if (collection === ids.AppBskyFeedLike) {
-        opsByType.likes.deletes.push({ uri })
-      } else if (collection === ids.AppBskyGraphFollow) {
-        opsByType.follows.deletes.push({ uri })
-      }
-    }
-  }
-
-  return opsByType
-}
-
-type OperationsByType = {
-  posts: Operations<PostRecord>
-  reposts: Operations<RepostRecord>
-  likes: Operations<LikeRecord>
-  follows: Operations<FollowRecord>
-}
-
-type Operations<T = Record<string, unknown>> = {
-  creates: CreateOp<T>[]
-  deletes: DeleteOp[]
-}
-
-type CreateOp<T> = {
-  uri: string
-  cid: string
-  author: string
-  record: T
-}
-
-type DeleteOp = {
-  uri: string
-}
-
-export const isPost = (obj: unknown): obj is PostRecord => {
-  return isType(obj, ids.AppBskyFeedPost)
-}
-
-export const isRepost = (obj: unknown): obj is RepostRecord => {
-  return isType(obj, ids.AppBskyFeedRepost)
-}
-
-export const isLike = (obj: unknown): obj is LikeRecord => {
-  return isType(obj, ids.AppBskyFeedLike)
-}
-
-export const isFollow = (obj: unknown): obj is FollowRecord => {
-  return isType(obj, ids.AppBskyGraphFollow)
-}
-
-const isType = (obj: unknown, nsid: string) => {
-  try {
-    lexicons.assertValidRecord(nsid, fixBlobRefs(obj))
-    return true
-  } catch (err) {
-    return false
-  }
-}
-
-// @TODO right now record validation fails on BlobRefs
-// simply because multiple packages have their own copy
-// of the BlobRef class, causing instanceof checks to fail.
-// This is a temporary solution.
-const fixBlobRefs = (obj: unknown): unknown => {
-  if (Array.isArray(obj)) {
-    return obj.map(fixBlobRefs)
-  }
-  if (obj && typeof obj === 'object') {
-    if (obj.constructor.name === 'BlobRef') {
-      const blob = obj as BlobRef
-      return new BlobRef(blob.ref, blob.mimeType, blob.size, blob.original)
-    }
-    return Object.entries(obj).reduce((acc, [key, val]) => {
-      return Object.assign(acc, { [key]: fixBlobRefs(val) })
-    }, {} as Record<string, unknown>)
-  }
-  return obj
 }

@@ -1,8 +1,4 @@
-import {
-  OutputSchema as RepoEvent,
-  isCommit,
-} from './lexicon/types/com/atproto/sync/subscribeRepos'
-import { FirehoseSubscriptionBase, getOpsByType } from './util/subscription'
+import { FirehoseSubscriptionBase, JetstreamEvent } from './util/subscription'
 
 const parse = (v: string | undefined, d: string) =>
   new Set(
@@ -57,32 +53,27 @@ export function matchesTag(record: any): boolean {
 }
 
 export class FirehoseSubscription extends FirehoseSubscriptionBase {
-  async handleEvent(evt: RepoEvent) {
-    if (!isCommit(evt)) return
+  async handleEvent(evt: JetstreamEvent) {
+    const commit = evt.commit
+    if (evt.kind !== 'commit' || !commit || commit.collection !== 'app.bsky.feed.post') return
 
-    const ops = await getOpsByType(evt)
+    const uri = `at://${evt.did}/${commit.collection}/${commit.rkey}`
 
-    const postsToDelete = ops.posts.deletes.map((del) => del.uri)
-    const postsToCreate = ops.posts.creates
-      .filter((create) => matchesTag(create.record))
-      .map((create) => {
-        console.log(`[match] ${create.uri} :: ${create.record.text.slice(0, 80).replace(/\n/g, ' ')}`)
-        return {
-          uri: create.uri,
-          cid: create.cid,
-          indexedAt: new Date().toISOString(),
-        }
-      })
-
-    if (postsToDelete.length > 0) {
-      await this.db.deleteFrom('post').where('uri', 'in', postsToDelete).execute()
+    if (commit.operation === 'delete') {
+      await this.db.deleteFrom('post').where('uri', '=', uri).execute()
+      return
     }
-    if (postsToCreate.length > 0) {
-      await this.db
-        .insertInto('post')
-        .values(postsToCreate)
-        .onConflict((oc) => oc.doNothing())
-        .execute()
-    }
+
+    // updates not supported yet
+    if (commit.operation !== 'create' || !commit.record || !commit.cid) return
+    if (!matchesTag(commit.record)) return
+
+    const text = typeof commit.record.text === 'string' ? commit.record.text : ''
+    console.log(`[match] ${uri} :: ${text.slice(0, 80).replace(/\n/g, ' ')}`)
+    await this.db
+      .insertInto('post')
+      .values({ uri, cid: commit.cid, indexedAt: new Date().toISOString() })
+      .onConflict((oc) => oc.doNothing())
+      .execute()
   }
 }

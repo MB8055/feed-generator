@@ -3,7 +3,7 @@
 ![Briar splash art](assets/Briar_OriginalCentered.jpg)
 
 A [Bluesky custom feed](https://bsky.app/profile/mb8055.com/feed/briar) for Briar from
-League of Legends. It subscribes to the Bluesky firehose, keeps the posts that are Briar
+League of Legends. It subscribes to the Bluesky Jetstream (posts only), keeps the posts that are Briar
 fanart, and serves them back newest-first.
 
 Feed URL: `at://did:plc:t6dzmaetp24txi5e2amguymz/app.bsky.feed.generator/briar`

@@ -11,8 +11,8 @@ const run = async () => {
     listenhost: maybeStr(process.env.FEEDGEN_LISTENHOST) ?? 'localhost',
     sqliteLocation: maybeStr(process.env.FEEDGEN_SQLITE_LOCATION) ?? ':memory:',
     subscriptionEndpoint:
-      maybeStr(process.env.FEEDGEN_SUBSCRIPTION_ENDPOINT) ??
-      'wss://bsky.network',
+      maybeStr(process.env.FEEDGEN_JETSTREAM_ENDPOINT) ??
+      'wss://jetstream2.us-east.bsky.network',
     publisherDid:
       maybeStr(process.env.FEEDGEN_PUBLISHER_DID) ?? 'did:example:alice',
     subscriptionReconnectDelay:
